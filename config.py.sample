@@ -1,0 +1,5 @@
+# This file contains the build configuration
+EC2_REGION='eu-west-1'
+AWS_ACCESS_KEY_ID='MyOwnAccessKey'
+AWS_SECRET_ACCESS_KEY='MySecretKeyDontStealIt'
+EC2_BUILD_INSTANCE='i-546554'
