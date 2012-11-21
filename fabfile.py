@@ -1,23 +1,27 @@
 import config
 import boto
 import boto.ec2
-from fabric.colors import green, red, yellow
+from boto.ec2.blockdevicemapping import EBSBlockDeviceType, BlockDeviceMapping 
+from fabric.colors import green, red, yellow, white
 from fabric.api import *
 from fabric.context_managers import cd
 import time
 from StringIO import StringIO
-import StringIO
 
 # Constants
 VOLUME_SIZE = getattr(config, 'VOLUME_SIZE', 15)
 MAIN_PARTITION_SIZE = getattr(config, 'MAIN_PARTITION_SIZE', VOLUME_SIZE-2)
 SWAP_PARTITION_SIZE = VOLUME_SIZE-MAIN_PARTITION_SIZE
 MAIN_PARTITION_MOUNT_POINT = getattr(config, 'MAIN_PARTITION_MOUNT_POINT', '/mnt/archec2build')
-PACKAGES = getattr(config, 'PACKAGES', 'base base-devel openssh polkit sudo')
 HOSTNAME = getattr(config, 'HOSTNAME', 'archec2')
 LANG = getattr(config, 'LANG', 'fr_FR.UTF-8')
 KEYMAP = getattr(config, 'KEYMAP', 'fr')
 TIMEZONE = getattr(config, 'TIMEZONE', 'Europe/Paris')
+PACKAGES_FILENAME = getattr(config, 'PACKAGES_FILENAME', 'packages')
+IMAGE_NAME = getattr(config, 'IMAGE_NAME', 'archec2image')
+IMAGE_DESCRIPTION = getattr(config, 'IMAGE_DESCRIPTION', 'ArchLinux EC2 Image')
+INSTANCE_KEY_NAME = getattr(config, 'INSTANCE_KEY_NAME', 'default.eu')
+INSTANCE_SECURITY_GROUP = getattr(config, 'INSTANCE_SECURITY_GROUP', 'default')
 
 FDISK_INPUT="""n
 p
@@ -46,8 +50,8 @@ MINIMAL_PACMAN_CONF="""
 HoldPkg     = pacman glibc
 SyncFirst   = pacman
 Architecture = %(arch)s
-#[ec2]
-#Server = file://${BASEDIR}/repo
+[ec2]
+Server = http://s3.amazonaws.com/repo.openance.com/ec2/$arch/
 [core]
 Include = /etc/pacman.d/mirrorlist
 [extra]
@@ -71,7 +75,6 @@ tmpfs /tmp tmpfs nodev,nosuid    0       0
 UUID=%(main_id)s / auto defaults,relatime,data=ordered 0 2
 UUID=%(swap_id)s none swap defaults 0 0
 """
-
 
 def create_ec2_connection(region=config.EC2_REGION):
     return boto.ec2.connect_to_region(config.EC2_REGION, aws_access_key_id=config.AWS_ACCESS_KEY_ID, aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY)
@@ -166,6 +169,12 @@ def find_snapshots(connection=create_ec2_connection, name='archec2build'):
         connection=connection()
     return connection.get_all_snapshots(filters={'tag:Name' : name})
 
+@task
+def delete_snapshots():
+    for snapshot in find_snapshots():
+        print green('Deleting snapshot with id %s' % snapshot.id)
+        snapshot.delete()
+
 USE_SNAPSHOT = getattr(config, 'USE_SNAPSHOT', False)
 SNAPSHOT_ID = getattr(config, 'SNAPSHOT_ID', find_snapshots()[0] if USE_SNAPSHOT else None)
 
@@ -237,22 +246,30 @@ def mount_main_partition(device_name):
 def unmount_main_partition():
     run('umount %s' % MAIN_PARTITION_MOUNT_POINT)
     run('rm -rf %s' % MAIN_PARTITION_MOUNT_POINT)
-                
-@task
-def create_volume_snapshot():
+
+def create_snapshot(name='archec2build'):
     instance, volume, device_name = get_volume()
-    snapshot = volume.connection.create_snapshot(volume.id, 'archec2build')
+    snapshot = volume.connection.create_snapshot(volume.id, name)
     if snapshot:    
         print green('Snapshot %s created' % snapshot.id)
         status = snapshot.update()
-        while status == 'pending':
+        while status != '100%':
             time.sleep(3)
             status = snapshot.update()
-        snapshot.add_tag('Name', 'archec2build')
-        snapshot.add_tag('archec2build', '')
+        snapshot.add_tag('Name', name)
+        snapshot.add_tag(name, '')
+        return snapshot
     else:
         print red('Snapshot not created')
+        return None
+                
+@task
+def create_volume_snapshot():
+    create_snapshot()
     
+def get_packages(filename=PACKAGES_FILENAME):
+    return ' '.join(filter(lambda line: not line.startswith('#'), [line[:-1] for line in open(filename)]))
+
 @task 
 def bootstrap_archlinux():
     instance, volume, device_name = get_volume()
@@ -261,7 +278,7 @@ def bootstrap_archlinux():
     pacman_filename = '/tmp/archec2build_pacman.conf'
     put(StringIO(MINIMAL_PACMAN_CONF % { 'arch' : arch}), pacman_filename )
     with hide('output'):    
-        run('pacstrap -C %s %s %s' % (pacman_filename, MAIN_PARTITION_MOUNT_POINT, PACKAGES))
+        run('pacstrap -C %s %s %s' % (pacman_filename, MAIN_PARTITION_MOUNT_POINT, get_packages()))
     unmount_main_partition()
     run('rm -rf %s' % pacman_filename)
     
@@ -333,4 +350,61 @@ def configure_archlinux():
     
     unmount_main_partition()
     
-    
+@task
+def create_image(name=IMAGE_NAME, description=IMAGE_DESCRIPTION):
+    instance, volume, device_name = get_volume()
+    snapshot = create_snapshot('archec2image')
+    if snapshot is None:
+        print red('Cannot create image with no snapshot')
+    else:
+        # Create block device mapping
+        ebs = EBSBlockDeviceType() 
+        ebs.snapshot_id = snapshot.id 
+        block_map = BlockDeviceMapping() 
+        block_map['/dev/sda'] = ebs 
+
+        # retrive attributes from current instance (TODO: should have a list)
+        attributes = instance.get_attribute('kernel')
+        attributes.update(instance.get_attribute('ramdisk'))
+        attributes.update(instance.get_attribute('rootDeviceName'))
+        
+        image_id = instance.connection.register_image(
+            name,
+            description,
+            architecture = instance.architecture,
+            kernel_id = attributes['kernel'],
+            ramdisk_id = attributes['ramdisk'],
+            root_device_name = attributes['rootDeviceName'],
+            block_device_map = block_map
+        )
+        
+        print green('Image id is %s' % image_id)
+        image = instance.connection.get_all_images((image_id,))[0]
+        image.add_tag('Name', name)
+
+def find_images(connection=create_ec2_connection, name=IMAGE_NAME):
+    if callable(connection):
+        connection=connection()
+    return connection.get_all_images(filters={'tag:Name' : name})
+
+@task
+def launch_instance():
+    images = find_images()
+    if not images or len(images) == 0:
+        print red('No images to launch')
+    else:
+        image = images[0]
+        print green('Creating instance with image %s' % image.id)
+        reservation = image.run(
+            key_name=INSTANCE_KEY_NAME, 
+            security_groups=(INSTANCE_SECURITY_GROUP,), 
+            instance_initiated_shutdown_behavior="stop")
+        if reservation:
+            instance = reservation.instances[0]
+            print green('Waiting for instance %s to be available...' % instance.id)
+            status = instance.update()
+            while status != 'running':
+                print white('Waiting...') 
+                time.sleep(3)
+                status = instance.update()
+            print green('Instance %s launched' % instance.id)
