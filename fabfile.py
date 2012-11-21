@@ -23,7 +23,7 @@ IMAGE_DESCRIPTION = getattr(config, 'IMAGE_DESCRIPTION', 'ArchLinux EC2 Image')
 INSTANCE_KEY_NAME = getattr(config, 'INSTANCE_KEY_NAME', 'default.eu')
 INSTANCE_SECURITY_GROUP = getattr(config, 'INSTANCE_SECURITY_GROUP', 'default')
 
-FDISK_INPUT="""n
+FDISK_INPUT_SAV="""n
 p
 
 
@@ -38,6 +38,14 @@ t
 82
 w
 """ % MAIN_PARTITION_SIZE
+
+FDISK_INPUT="""n
+p
+
+
+
+w
+"""
 
 FDISK_DELETE_INPUT="""d
 1
@@ -73,8 +81,8 @@ title  Arch Linux
 FSTAB_TEMPLATE="""
 tmpfs /tmp tmpfs nodev,nosuid    0       0
 UUID=%(main_id)s / auto defaults,relatime,data=ordered 0 2
-UUID=%(swap_id)s none swap defaults 0 0
 """
+#UUID=%(swap_id)s none swap defaults 0 0
 
 def create_ec2_connection(region=config.EC2_REGION):
     return boto.ec2.connect_to_region(config.EC2_REGION, aws_access_key_id=config.AWS_ACCESS_KEY_ID, aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY)
@@ -169,11 +177,18 @@ def find_snapshots(connection=create_ec2_connection, name='archec2build'):
         connection=connection()
     return connection.get_all_snapshots(filters={'tag:Name' : name})
 
-@task
-def delete_snapshots():
-    for snapshot in find_snapshots():
+def delete_snapshots(name='archec2build'):
+    for snapshot in find_snapshots(name=name):
         print green('Deleting snapshot with id %s' % snapshot.id)
         snapshot.delete()
+
+@task
+def delete_build_snapshots():
+    delete_snapshots(name='archec2build')
+
+@task
+def delete_image_snapshots():
+    delete_snapshots(name='archec2image')
 
 USE_SNAPSHOT = getattr(config, 'USE_SNAPSHOT', False)
 SNAPSHOT_ID = getattr(config, 'SNAPSHOT_ID', find_snapshots()[0] if USE_SNAPSHOT else None)
@@ -236,8 +251,8 @@ def delete_volume_partitions():
 @task
 def format_volume_partitions():
     instance, volume, device_name = get_volume()
-    run("mkfs.ext4 -L ac2root %s1" % device_name)
-    run("mkswap -L ac2swap %s2" % device_name)
+    run("mkfs.ext3 -L ac2root %s1" % device_name)
+    #run("mkswap -L ac2swap %s2" % device_name)
 
 def mount_main_partition(device_name):
     run('mkdir -p %s' % MAIN_PARTITION_MOUNT_POINT)
@@ -334,8 +349,8 @@ def configure_archlinux():
     fstab = '%s/etc/fstab' % MAIN_PARTITION_MOUNT_POINT
     run('mv %(path)s %(path)s.orig' % { 'path' : fstab})
     main_partition_id = run('blkid -c /dev/null -s UUID -o value %s1' % device_name)
-    swap_partition_id = run('blkid -c /dev/null -s UUID -o value %s2' % device_name)
-    fstab_content = FSTAB_TEMPLATE % { 'main_id' : main_partition_id, 'swap_id' : swap_partition_id}
+    #swap_partition_id = run('blkid -c /dev/null -s UUID -o value %s2' % device_name)
+    fstab_content = FSTAB_TEMPLATE % { 'main_id' : main_partition_id, 'swap_id' : None}
     put(StringIO(fstab_content), fstab)
     
     # nameserver
@@ -379,6 +394,7 @@ def create_image(name=IMAGE_NAME, description=IMAGE_DESCRIPTION):
         )
         
         print green('Image id is %s' % image_id)
+        time.sleep(3)
         image = instance.connection.get_all_images((image_id,))[0]
         image.add_tag('Name', name)
 
@@ -386,6 +402,12 @@ def find_images(connection=create_ec2_connection, name=IMAGE_NAME):
     if callable(connection):
         connection=connection()
     return connection.get_all_images(filters={'tag:Name' : name})
+
+@task
+def delete_images(name=IMAGE_NAME):
+    for image in find_images(name=name):
+        print green('Deleting image %s' % image.id)
+        image.deregister()
 
 @task
 def launch_instance():
@@ -407,4 +429,17 @@ def launch_instance():
                 print white('Waiting...') 
                 time.sleep(3)
                 status = instance.update()
-            print green('Instance %s launched' % instance.id)
+            instance.add_tag('archec2instance', '')
+            print green('Instance %s with dns_name %s launched' % (instance.id, instance.dns_name))
+
+def find_instances(connection=create_ec2_connection, tag='archec2instance'):
+    if callable(connection):
+        connection=connection()
+    return [res.instances[0] for res in  connection.get_all_instances(filters={'tag:%s' % tag: ''})]
+
+@task
+def delete_instances():
+    for instance in find_instances():
+        if instance.update() == 'running':
+            print green('Deleting running instance with id %s and dns_name %s' % (instance.id, instance.dns_name))
+            instance.terminate()
