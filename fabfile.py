@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import config
 import boto
 import boto.ec2
@@ -6,6 +7,7 @@ from fabric.colors import green, red, yellow, white
 from fabric.api import *
 from fabric.context_managers import cd
 import time
+import datetime
 from StringIO import StringIO
 
 # Constants
@@ -18,10 +20,10 @@ LANG = getattr(config, 'LANG', 'fr_FR.UTF-8')
 KEYMAP = getattr(config, 'KEYMAP', 'fr')
 TIMEZONE = getattr(config, 'TIMEZONE', 'Europe/Paris')
 PACKAGES_FILENAME = getattr(config, 'PACKAGES_FILENAME', 'packages')
-IMAGE_NAME = getattr(config, 'IMAGE_NAME', 'archec2image')
 IMAGE_DESCRIPTION = getattr(config, 'IMAGE_DESCRIPTION', 'ArchLinux EC2 Image')
 INSTANCE_KEY_NAME = getattr(config, 'INSTANCE_KEY_NAME', 'default.eu')
 INSTANCE_SECURITY_GROUP = getattr(config, 'INSTANCE_SECURITY_GROUP', 'default')
+
 
 FDISK_INPUT_SAV="""n
 p
@@ -71,11 +73,12 @@ Include = /etc/pacman.d/mirrorlist
 GRUB_MENU_LST="""
 default 0
 timeout 1
+hiddenmenu
 
 title  Arch Linux
     root   (hd0,0)
-    kernel /boot/vmlinuz-linux-ec2 root=/dev/xvda1 ip=dhcp console=hvc0 spinlock=tickless ro init=/bin/systemd
-    initrd /boot/initramfs-linux-ec2.img
+    kernel /boot/vmlinuz-linux root=/dev/xvda1 console=hvc0 spinlock=tickless ro rootwait rootfstype=ext4 earlyprintk=xen,verbose loglevel=7
+    initrd /boot/initramfs-linux.img
 """
 
 FSTAB_TEMPLATE="""
@@ -99,37 +102,15 @@ def get_instance(connection=create_ec2_connection, instance_id=config.EC2_BUILD_
 def get_hostname_from_instance(connection, instance_id=config.EC2_BUILD_INSTANCE):
     return get_instance(connection, instance_id).dns_name
     
-    
-# Steps to produce the AMI
-#
-# - Check that the build environment is ok -> OK
-# - Create the EBS volume -> OK
-# - Attach the EBS volume to the build machine -> OK
-# - Build partitions on the volume -> OK
-# - Format the partitions on the volume -> OK
-# - Mount the main partition -> OK
-# - launch pacstrap -> OK
-# - Create configuration files
-#   - hostname -> OK
-#   - locale -> OK
-#   - timezone -> OK
-#   - time format ->OK
-#   - vconsole keymap -> OK
-#   - fstab -> OK
-#   - ssh config -> OK
-#   - root account -> OK
-# - Enable systemd services
-#   - sshd -> OK
-#   - cron
-#   - ec2
-# - Create grub file -> OK
-# - Unmout the filesystem
-# - un-attach the volume
-# - create a snapshot
-# - create the AMI from the snapshot
-# - Launch an instance from the snapshot
-
 env.hosts = [ 'root@%s' % get_hostname_from_instance(create_ec2_connection())]
+
+ARCH = getattr(config, 'ARCH', get_instance().architecture)
+PREFIX = getattr(config, 'PREFIX', 'archec2.%s' % datetime.datetime.today().strftime('%Y%m%d'))
+IMAGE_NAME = getattr(config, 'IMAGE_NAME', '%s.image.%s' % (PREFIX, ARCH))
+SNAPSHOT_NAME = getattr(config, 'SNAPSHOT_NAME', '%s.build.%s' % (PREFIX, ARCH))
+VOLUME_NAME = getattr(config, 'VOLUME_NAME', SNAPSHOT_NAME)
+INSTANCE_NAME = getattr(config, 'INSTANCE_NAME', '%s.instance.%s' % (PREFIX, ARCH))
+
 
 def install_packages(*args):
     with hide('output'):
@@ -168,27 +149,27 @@ def find_build_device(instance):
     for mount_point, device in instance.block_device_mapping.iteritems():
         if not device.delete_on_termination:
             volume =  instance.connection.get_all_volumes((device.volume_id,))[0]
-            if volume.tags.has_key('archec2build'):
+            if volume.tags.has_key(VOLUME_NAME):
                 return (volume, mount_point.replace('/sd', '/xvd'))
     return (None,None)
 
-def find_snapshots(connection=create_ec2_connection, name='archec2build'):
+def find_snapshots(connection=create_ec2_connection, name=SNAPSHOT_NAME):
     if callable(connection):
         connection=connection()
     return connection.get_all_snapshots(filters={'tag:Name' : name})
 
-def delete_snapshots(name='archec2build'):
+def delete_snapshots(name=SNAPSHOT_NAME):
     for snapshot in find_snapshots(name=name):
         print green('Deleting snapshot with id %s' % snapshot.id)
         snapshot.delete()
 
 @task
 def delete_build_snapshots():
-    delete_snapshots(name='archec2build')
+    delete_snapshots(name=SNAPSHOT_NAME)
 
 @task
 def delete_image_snapshots():
-    delete_snapshots(name='archec2image')
+    delete_snapshots(name=IMAGE_NAME)
 
 USE_SNAPSHOT = getattr(config, 'USE_SNAPSHOT', False)
 SNAPSHOT_ID = getattr(config, 'SNAPSHOT_ID', find_snapshots()[0] if USE_SNAPSHOT else None)
@@ -199,7 +180,8 @@ def create_and_attach_volume():
     instance = get_instance(connection)
     print green('Attach volume using snapshot %s' % SNAPSHOT_ID)
     vol = connection.create_volume(VOLUME_SIZE, instance.placement, snapshot=SNAPSHOT_ID)
-    vol.add_tag('archec2build', '')
+    vol.add_tag(SNAPSHOT_NAME, '')
+    vol.add_tag('Name', SNAPSHOT_NAME)
     mount_point = find_free_device(instance)
     vol.attach(instance.id, mount_point)
     status = vol.update()
@@ -221,12 +203,13 @@ def decomission_volume():
     if not volume:
         print red("Could not find build volume")
     else:
-        print green("Found build volume at device %s" % mount_point)
+        print green("Detaching volume at device %s" % mount_point)
         volume.detach()
         status = volume.update()
         while status != 'available':
             time.sleep(5)
             status = volume.update()
+        print green("Deleting volume %s" % volume.id)
         volume.delete()        
     
     
@@ -251,7 +234,7 @@ def delete_volume_partitions():
 @task
 def format_volume_partitions():
     instance, volume, device_name = get_volume()
-    run("mkfs.ext3 -L ac2root %s1" % device_name)
+    run("mkfs.ext4 -L ac2root %s1" % device_name)
     #run("mkswap -L ac2swap %s2" % device_name)
 
 def mount_main_partition(device_name):
@@ -262,11 +245,11 @@ def unmount_main_partition():
     run('umount %s' % MAIN_PARTITION_MOUNT_POINT)
     run('rm -rf %s' % MAIN_PARTITION_MOUNT_POINT)
 
-def create_snapshot(name='archec2build'):
+def create_snapshot(name=SNAPSHOT_NAME):
     instance, volume, device_name = get_volume()
     snapshot = volume.connection.create_snapshot(volume.id, name)
     if snapshot:    
-        print green('Snapshot %s created' % snapshot.id)
+        print green('Snapshot %s created with name %s' % (snapshot.id, name))
         status = snapshot.update()
         while status != '100%':
             time.sleep(3)
@@ -292,8 +275,11 @@ def bootstrap_archlinux():
     arch = run('uname -m')    
     pacman_filename = '/tmp/archec2build_pacman.conf'
     put(StringIO(MINIMAL_PACMAN_CONF % { 'arch' : arch}), pacman_filename )
-    with hide('output'):    
-        run('pacstrap -C %s %s %s' % (pacman_filename, MAIN_PARTITION_MOUNT_POINT, get_packages()))
+    with hide('output'):
+        if USE_SNAPSHOT:
+            run('arch-chroot %s pacman -Syu --noconfirm' % MAIN_PARTITION_MOUNT_POINT)
+        else:    
+            run('pacstrap -C %s %s %s' % (pacman_filename, MAIN_PARTITION_MOUNT_POINT, get_packages()))
     unmount_main_partition()
     run('rm -rf %s' % pacman_filename)
     
@@ -322,6 +308,7 @@ def configure_archlinux():
     run('arch-chroot %s locale-gen' % MAIN_PARTITION_MOUNT_POINT)
     run('arch-chroot %s systemctl enable sshd.service' % MAIN_PARTITION_MOUNT_POINT)
     run('arch-chroot %s systemctl enable cronie.service' % MAIN_PARTITION_MOUNT_POINT)
+    run('arch-chroot %s systemctl enable dhcpcd\\@eth0.service' % MAIN_PARTITION_MOUNT_POINT)
     run('arch-chroot %s systemctl enable ec2.service' % MAIN_PARTITION_MOUNT_POINT)
     run('arch-chroot %s hwclock --systohc --utc' % MAIN_PARTITION_MOUNT_POINT)
     
@@ -356,7 +343,7 @@ def configure_archlinux():
     # nameserver
     resolv = '%s/etc/resolv.conf' % MAIN_PARTITION_MOUNT_POINT
     run('mv %(path)s %(path)s.orig' % { 'path' : resolv})
-    put(StringIO("nameserver 172.16.0.23"), resolv)
+    put(StringIO("nameserver 172.16.0.23\n"), resolv)
 
     # pacman.conf    
     arch = run('uname -m')    
@@ -368,7 +355,7 @@ def configure_archlinux():
 @task
 def create_image(name=IMAGE_NAME, description=IMAGE_DESCRIPTION):
     instance, volume, device_name = get_volume()
-    snapshot = create_snapshot('archec2image')
+    snapshot = create_snapshot(IMAGE_NAME)
     if snapshot is None:
         print red('Cannot create image with no snapshot')
     else:
@@ -387,9 +374,9 @@ def create_image(name=IMAGE_NAME, description=IMAGE_DESCRIPTION):
             name,
             description,
             architecture = instance.architecture,
-            kernel_id = attributes['kernel'],
+            kernel_id = 'aki-41eec435' if ARCH == 'x86_64' else 'aki-47eec433',
             ramdisk_id = attributes['ramdisk'],
-            root_device_name = attributes['rootDeviceName'],
+            root_device_name = attributes['rootDeviceName'] or '/dev/sda',
             block_device_map = block_map
         )
         
@@ -424,15 +411,17 @@ def launch_instance():
         if reservation:
             instance = reservation.instances[0]
             print green('Waiting for instance %s to be available...' % instance.id)
+            time.sleep(3)
             status = instance.update()
             while status != 'running':
                 print white('Waiting...') 
                 time.sleep(3)
                 status = instance.update()
-            instance.add_tag('archec2instance', '')
+            instance.add_tag(INSTANCE_NAME, '')
+            instance.add_tag('Name', INSTANCE_NAME)
             print green('Instance %s with dns_name %s launched' % (instance.id, instance.dns_name))
 
-def find_instances(connection=create_ec2_connection, tag='archec2instance'):
+def find_instances(connection=create_ec2_connection, tag=INSTANCE_NAME):
     if callable(connection):
         connection=connection()
     return [res.instances[0] for res in  connection.get_all_instances(filters={'tag:%s' % tag: ''})]
@@ -443,3 +432,15 @@ def delete_instances():
         if instance.update() == 'running':
             print green('Deleting running instance with id %s and dns_name %s' % (instance.id, instance.dns_name))
             instance.terminate()
+            
+@task
+def make_image():
+    check_install_scripts()
+    create_and_attach_volume()
+    time.sleep(10)
+    create_volume_partitions()
+    format_volume_partitions()
+    bootstrap_archlinux()
+    create_volume_snapshot()
+    configure_archlinux()
+    create_image()

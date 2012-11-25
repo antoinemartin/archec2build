@@ -37,8 +37,8 @@ less
 lesspipe
 libtool
 licenses
-linux-ec2
-linux-ec2-headers
+linux
+linux-headers
 logrotate
 lvm2
 m4
