@@ -99,10 +99,11 @@ def get_instance(connection=create_ec2_connection, instance_id=config.EC2_BUILD_
     return reservation.instances[0]
 
     
-def get_hostname_from_instance(connection, instance_id=config.EC2_BUILD_INSTANCE):
+def get_hostname_from_instance(connection=create_ec2_connection, instance_id=config.EC2_BUILD_INSTANCE):
     return get_instance(connection, instance_id).dns_name
     
-env.hosts = [ 'root@%s' % get_hostname_from_instance(create_ec2_connection())]
+env.user = 'root'
+env.hosts = [ '%s' % get_hostname_from_instance()]
 
 ARCH = getattr(config, 'ARCH', get_instance().architecture)
 PREFIX = getattr(config, 'PREFIX', 'archec2.%s' % datetime.datetime.today().strftime('%Y%m%d'))
@@ -384,6 +385,7 @@ def create_image(name=IMAGE_NAME, description=IMAGE_DESCRIPTION):
         time.sleep(3)
         image = instance.connection.get_all_images((image_id,))[0]
         image.add_tag('Name', name)
+        image.add_tag(name, '')
 
 def find_images(connection=create_ec2_connection, name=IMAGE_NAME):
     if callable(connection):
@@ -397,8 +399,9 @@ def delete_images(name=IMAGE_NAME):
         image.deregister()
 
 @task
-def launch_instance():
-    images = find_images()
+def launch_instance(image_name=IMAGE_NAME, instance_name=INSTANCE_NAME):
+    images = find_images(name=image_name)
+    instance = None
     if not images or len(images) == 0:
         print red('No images to launch')
     else:
@@ -417,9 +420,10 @@ def launch_instance():
                 print white('Waiting...') 
                 time.sleep(3)
                 status = instance.update()
-            instance.add_tag(INSTANCE_NAME, '')
-            instance.add_tag('Name', INSTANCE_NAME)
+            instance.add_tag(instance_name, '')
+            instance.add_tag('Name', instance_name)
             print green('Instance %s with dns_name %s launched' % (instance.id, instance.dns_name))
+    return instance
 
 def find_instances(connection=create_ec2_connection, tag=INSTANCE_NAME):
     if callable(connection):
@@ -427,8 +431,8 @@ def find_instances(connection=create_ec2_connection, tag=INSTANCE_NAME):
     return [res.instances[0] for res in  connection.get_all_instances(filters={'tag:%s' % tag: ''})]
 
 @task
-def delete_instances():
-    for instance in find_instances():
+def delete_instances(tag=INSTANCE_NAME):
+    for instance in find_instances(tag=tag):
         if instance.update() == 'running':
             print green('Deleting running instance with id %s and dns_name %s' % (instance.id, instance.dns_name))
             instance.terminate()
@@ -444,3 +448,15 @@ def make_image():
     create_volume_snapshot()
     configure_archlinux()
     create_image()
+    
+@task 
+def launch_instance_and_wait(image_name=IMAGE_NAME, instance_name=INSTANCE_NAME):
+    instance = launch_instance(image_name, instance_name)
+    with settings(
+        hide('output'),
+        host_string='%s' % get_hostname_from_instance(instance_id=instance.id), 
+        warn_only=True,
+        connection_attempts=5):
+        print green('Waiting for server to answser...')
+        run('uname -a')
+        
