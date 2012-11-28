@@ -664,9 +664,14 @@ def check_connectivity(name=INSTANCE_NAME):
 
 
 def change_base(find_method, base_name, new_name=None):
-    old = find_method(name=base_name)[0]
-    _new = find_method(name=new_name)[0] if new_name else find_method()[0]  
-    old.remove_tag(base_name)
+    old = None 
+    try:
+        old = find_method(name=base_name)[0]
+    except:
+        pass
+    _new = find_method(name=new_name)[0] if new_name else find_method()[0]
+    if old:  
+        old.remove_tag(base_name)
     _new.add_tag(base_name, '')
     
 @task(default=True)
