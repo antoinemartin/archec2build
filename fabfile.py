@@ -5,6 +5,7 @@ import boto.ec2
 from boto.ec2.blockdevicemapping import EBSBlockDeviceType, BlockDeviceMapping 
 from fabric.colors import green, red, yellow, white, blue
 from fabric.api import *
+from fabric.utils import abort
 from fabric.context_managers import cd
 import time
 import datetime
@@ -97,6 +98,12 @@ UUID=%(main_id)s / auto defaults,relatime,data=ordered 0 2
 """
 #UUID=%(swap_id)s none swap defaults 0 0
 
+S3_FSTAB_TEMPLATE="""
+tmpfs /tmp tmpfs nodev,nosuid    0       0
+/dev/xvda1 / auto defaults,relatime,data=ordered 0 2
+/dev/xvda3 none swap defaults 0 0
+"""
+
 MIRRORLIST="""
 Server = http://mirror.i3d.net/pub/archlinux/$repo/os/$arch
 Server = http://archlinux.mirrors.ovh.net/archlinux/$repo/os/$arch
@@ -107,6 +114,7 @@ Server = http://mir.archlinux.fr/$repo/os/$arch
 Server = http://ftp.iinet.net.au/pub/archlinux/$repo/os/$arch
 Server = http://archlinux.supsec.org/$repo/os/$arch
 """
+    
 
 def create_ec2_connection(region=config.EC2_REGION):
     return boto.ec2.connect_to_region(config.EC2_REGION, aws_access_key_id=config.AWS_ACCESS_KEY_ID, aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY)
@@ -114,38 +122,63 @@ def create_ec2_connection(region=config.EC2_REGION):
 def get_instance(connection=create_ec2_connection, instance_id=None):
     if callable(connection):
         connection = connection()
-    instance_id = instance_id or EC2_BUILD_INSTANCE
+    instance_id = instance_id or get_build_instance()
     reservation = connection.get_all_instances(instance_ids=(instance_id,))[0]
     if not reservation:
         raise Exception('No instance with name %s' % instance_id)
     return reservation.instances[0]
 
+def get_arch():
+    try:
+        return get_instance().architecture
+    except:
+        return 'x86_64'
     
 def get_hostname_from_instance(connection=create_ec2_connection, instance_id=None):
-    instance_id = instance_id or EC2_BUILD_INSTANCE
+    instance_id = instance_id or get_build_instance()
     return get_instance(connection, instance_id).dns_name
     
-env.user = 'root'
-env.hosts = [ get_hostname_from_instance()]
 
 SNAPSHOT_NAME_TEMPLATE = '%s.build.%s'
 IMAGE_NAME_TEMPLATE = '%s.image.%s'
 INSTANCE_NAME_TEMPLATE = '%s.instance.%s'
 
-ARCH = getattr(config, 'ARCH', get_instance().architecture)
+ARCH = getattr(config, 'ARCH', get_arch())
 BASE_PREFIX = getattr(config, 'BASE_PREFIX', 'archec2')
+BASE_S3_PREFIX = getattr(config, 'BASE_S3_PREFIX', '%s.s3' % BASE_PREFIX)
 DATE_STRING = getattr(config, 'DATE_STRING', datetime.datetime.today().strftime('%Y%m%d'))
 PREFIX = getattr(config, 'PREFIX', '%s.%s' % (BASE_PREFIX, DATE_STRING))
+S3_PREFIX = getattr(config, 'S3_PREFIX', '%s.%s' % (BASE_S3_PREFIX, DATE_STRING))
 
-IMAGE_NAME = getattr(config, 'IMAGE_NAME', IMAGE_NAME_TEMPLATE % (PREFIX, ARCH))
+IMAGE_NAME = getattr(config, 'S3_IMAGE_NAME', IMAGE_NAME_TEMPLATE % (PREFIX, ARCH))
+S3_IMAGE_NAME = getattr(config, 'IMAGE_NAME', IMAGE_NAME_TEMPLATE % (S3_PREFIX, ARCH))
 SNAPSHOT_NAME = getattr(config, 'SNAPSHOT_NAME', SNAPSHOT_NAME_TEMPLATE % (PREFIX, ARCH))
 VOLUME_NAME = getattr(config, 'VOLUME_NAME', SNAPSHOT_NAME)
 INSTANCE_NAME = getattr(config, 'INSTANCE_NAME', INSTANCE_NAME_TEMPLATE % (PREFIX, ARCH))
+S3_INSTANCE_NAME = getattr(config, 'S3_INSTANCE_NAME', INSTANCE_NAME_TEMPLATE % (S3_PREFIX, ARCH))
 
-BASE_IMAGE_NAME = getattr(config, 'IMAGE_NAME', IMAGE_NAME_TEMPLATE % (BASE_PREFIX, ARCH))
-BASE_SNAPSHOT_NAME = getattr(config, 'SNAPSHOT_NAME', SNAPSHOT_NAME_TEMPLATE % (BASE_PREFIX, ARCH))
-BASE_INSTANCE_NAME = getattr(config, 'INSTANCE_NAME', INSTANCE_NAME_TEMPLATE % (BASE_PREFIX, ARCH))
+BASE_IMAGE_NAME = getattr(config, 'BASE_IMAGE_NAME', IMAGE_NAME_TEMPLATE % (BASE_PREFIX, ARCH))
+BASE_S3_IMAGE_NAME = getattr(config, 'BASE_S3_IMAGE_NAME', IMAGE_NAME_TEMPLATE % (BASE_S3_PREFIX, ARCH))
+BASE_SNAPSHOT_NAME = getattr(config, 'BASE_SNAPSHOT_NAME', SNAPSHOT_NAME_TEMPLATE % (BASE_PREFIX, ARCH))
+BASE_INSTANCE_NAME = getattr(config, 'BASE_INSTANCE_NAME', INSTANCE_NAME_TEMPLATE % (BASE_PREFIX, ARCH))
+BASE_S3_INSTANCE_NAME = getattr(config, 'BASE_S3_INSTANCE_NAME', INSTANCE_NAME_TEMPLATE % (BASE_S3_PREFIX, ARCH))
 
+
+def get_kernel(s3=False, region=config.EC2_REGION, arch = ARCH ):
+    EC2_PV_KERNELS = {
+    
+      'us‐east‐1' : ('aki‐4c7d9525', 'aki‐4e7d9527', 'aki‐407d9529', 'aki‐427d952b'),
+      'us‐west‐1' : ('aki‐9da0f1d8', 'aki‐9fa0f1da', 'aki‐99a0f1dc', 'aki‐9ba0f1de'),
+      'eu‐west‐1' : ('aki‐47eec433', 'aki‐41eec435', 'aki‐4deec439', 'aki‐4feec43b'),
+      'ap‐southeast‐1' : ('aki‐6fd5aa3d', 'aki‐6dd5aa3f', 'aki‐13d5aa41', 'aki‐11d5aa43'),
+    }
+    if not EC2_PV_KERNELS.has_key(region):
+        raise Exception("Unknown region %s" % region)
+    kernels = EC2_PV_KERNELS[region]
+    index = 2 if s3 else 0
+    if arch == 'x86_64':
+        index = index + 1
+    return kernels[index]
 
 def install_packages(*args):
     with hide('output'):
@@ -153,8 +186,7 @@ def install_packages(*args):
         
 def remove_packages(*args):
     with hide('output'):
-        run('pacman -Rc --noconfirm %s' % ' '.join(args) )
-        
+        run('pacman -Rc --noconfirm --unneeded %s' % ' '.join(args) )
 
 @task()
 def check_install_scripts():
@@ -165,12 +197,7 @@ def check_install_scripts():
         put(StringIO(MIRRORLIST), '/etc/pacman.d/mirrorlist.backup')
         run('rankmirrors -n 3 /etc/pacman.d/mirrorlist.backup > /etc/pacman.d/mirrorlist')
         run('pacman -Syy')
-    out = run('pacman -Qi arch-install-scripts', quiet=True)
-    if out.failed:
-        print yellow("Arch install scripts is not installed. Installing...")
-        install_packages('arch-install-scripts')
-    else:
-        print green("Arch install scripts is installed")
+    install_packages('arch-install-scripts','ec2-ami-tools')
         
 @task()
 def clean_env():
@@ -220,6 +247,18 @@ def find_instances(connection=create_ec2_connection, name=INSTANCE_NAME):
         result =  connection.get_all_instances(filters={'tag:Name' : name})
     return [res.instances[0] for res in result]
 
+def find_running_instances(connection=create_ec2_connection, name=BASE_INSTANCE_NAME):
+    return filter(lambda x : x.update() == 'running', find_instances(connection,name))
+    
+def get_build_instance():
+    global EC2_BUILD_INSTANCE,env
+    if EC2_BUILD_INSTANCE == 'Unknown':
+        running_instances = find_running_instances()
+        if running_instances and len(running_instances) > 0:
+            build_instance = running_instances[0]
+            EC2_BUILD_INSTANCE = build_instance.id
+            env.hosts = [ build_instance.dns_name ]
+    return EC2_BUILD_INSTANCE
 
 def delete_snapshots(name=SNAPSHOT_NAME):
     for snapshot in find_snapshots(name=name):
@@ -430,6 +469,7 @@ def configure_archlinux():
 def create_image(name=IMAGE_NAME, description=IMAGE_DESCRIPTION):
     instance, volume, device_name = get_volume()
     snapshot = create_snapshot(IMAGE_NAME)
+    image = None
     if snapshot is None:
         print red('Cannot create image with no snapshot')
     else:
@@ -447,16 +487,17 @@ def create_image(name=IMAGE_NAME, description=IMAGE_DESCRIPTION):
             name,
             description,
             architecture = instance.architecture,
-            kernel_id = 'aki-41eec435' if ARCH == 'x86_64' else 'aki-47eec433',
+            kernel_id = get_kernel(),
             ramdisk_id = attributes['ramdisk'],
             root_device_name = attributes['rootDeviceName'] or '/dev/sda',
             block_device_map = block_map
         )
         
         print green('Image id is %s' % image_id)
-        time.sleep(3)
+        time.sleep(5)
         image = instance.connection.get_all_images((image_id,))[0]
         add_name(image, name)
+    return image
 
 @task
 def delete_images(name=IMAGE_NAME):
@@ -465,7 +506,7 @@ def delete_images(name=IMAGE_NAME):
         image.deregister()
 
 @task
-def launch_instance(image_name=IMAGE_NAME, instance_name=INSTANCE_NAME):
+def launch_instance(image_name=BASE_IMAGE_NAME, instance_name=BASE_INSTANCE_NAME):
     images = find_images(name=image_name)
     instance = None
     if not images or len(images) == 0:
@@ -473,10 +514,15 @@ def launch_instance(image_name=IMAGE_NAME, instance_name=INSTANCE_NAME):
     else:
         image = images[0]
         print green('Creating instance with image %s' % image.id)
-        reservation = image.run(
+        args = dict(
             key_name=INSTANCE_KEY_NAME, 
             security_groups=(INSTANCE_SECURITY_GROUP,), 
-            instance_initiated_shutdown_behavior="stop")
+        )
+        if image.root_device_type != 'instance-store':
+            args.update({
+                'instance_initiated_shutdown_behavior'  : "stop",
+            })
+        reservation = image.run(**args)
         if reservation:
             instance = reservation.instances[0]
             print green('Waiting for instance %s to be available...' % instance.id)
@@ -499,6 +545,89 @@ def delete_instances(name=INSTANCE_NAME):
             instance.terminate()
             
 @task
+def create_s3_image(name=S3_IMAGE_NAME, description=IMAGE_DESCRIPTION):
+    instance, volume, device_name = get_volume()
+    mount_main_partition(device_name)
+    
+    # change menu.lst
+    run("sed 's/(hd0,0)/(hd0)/#' -i %s/boot/grub/menu.lst" % MAIN_PARTITION_MOUNT_POINT)
+    run('yes | LANG=C pacman -r %s -Scc' % MAIN_PARTITION_MOUNT_POINT)
+    
+    fstab = '%s/etc/fstab' % MAIN_PARTITION_MOUNT_POINT
+    put(StringIO(S3_FSTAB_TEMPLATE), fstab)    
+    
+    cert = '/tmp/cert.pem'
+    pk = '/tmp/pk.pem'
+        
+    # upload certificates
+    put(config.EC2_CERT_FILE, cert)
+    put(config.EC2_PK_FILE, pk)
+    
+    parameters = {
+        'user' : config.AWS_ACCOUNT_ID,
+        'cert' : cert,
+        'pk' : pk,
+        'arch' : ARCH,
+        'prefix' : name,
+        'kernel': get_kernel(True),
+        'path' : MAIN_PARTITION_MOUNT_POINT,
+        'access' : config.AWS_ACCESS_KEY_ID,
+        'secret' : config.AWS_SECRET_ACCESS_KEY,
+        'manifest' : '/mnt/%s.manifest.xml' % name,
+        'bucket' : config.S3_AMI_BUCKET,
+        'location' : config.S3_LOCATION,
+        'region' : config.EC2_REGION,
+    }
+    
+    with settings(warn_only=True):
+        print green('Creating image bundle')
+        out = run('ec2-bundle-vol -u %(user)s -c %(cert)s -k %(pk)s -d /mnt -p %(prefix)s -r %(arch)s --kernel %(kernel)s -v %(path)s -B "ami=sda1,root=/dev/sda1,ephemeral0=sda2,swap=sda3"' % parameters)
+        #run('ec2-migrate-manifest -c %(cert)s -k %(pk)s -a %(access)s -s %(secret)s -m %(manifest)s --region %(region)s' % parameters)
+        run('rm -rf %s %s' % (cert, pk))
+        unmount_main_partition()
+        if out.failed:
+            abort('Failed to build bundle')
+
+    print green('Uploading bundle to S3')
+    run('yes | ec2-upload-bundle -b %(bucket)s -m %(manifest)s -a %(access)s -s %(secret)s' % parameters)
+    
+    image_id = instance.connection.register_image(
+        name,
+        description,
+        image_location = '%s/%s.manifest.xml' % (config.S3_AMI_BUCKET, name),
+    )
+    
+    print green('Image id is %s' % image_id)
+    time.sleep(3)
+    image = instance.connection.get_all_images((image_id,))[0]
+    add_name(image, name)
+    
+    print green('cleaning')
+    run('rm /mnt/%s*' % name) 
+    return image
+    
+    
+@task
+def delete_s3_image(name=S3_IMAGE_NAME):
+    for image in find_images(name=name):
+        print green('Deleting image %s' % image.id)
+        image.deregister()
+    parameters = {
+        'access' : config.AWS_ACCESS_KEY_ID,
+        'secret' : config.AWS_SECRET_ACCESS_KEY,
+        'manifest' : '%s.manifest.xml' % name,
+        'prefix' : name,
+        'bucket' : config.S3_AMI_BUCKET,
+        'location' : config.S3_LOCATION,
+        'region' : config.EC2_REGION,
+    }
+    local('ec2-delete-bundle -b %(bucket)s -p %(prefix)s -a %(access)s -s %(secret)s -y' % parameters)
+        
+        
+    
+
+    
+@task
 def make_image(create_snapshot=False):
     check_install_scripts()
     create_and_attach_volume()
@@ -509,7 +638,7 @@ def make_image(create_snapshot=False):
     if create_snapshot:
         create_volume_snapshot()
     configure_archlinux()
-    create_image()
+    return create_image()
     
     
 def check_instance(instance):
@@ -522,14 +651,14 @@ def check_instance(instance):
         run('uname -a')    
     
 @task 
-def launch_instance_and_wait(image_name=IMAGE_NAME, instance_name=INSTANCE_NAME):
+def launch_instance_and_wait(image_name=BASE_IMAGE_NAME, instance_name=BASE_INSTANCE_NAME):
     instance = launch_instance(image_name, instance_name)
     check_instance(instance)
     return instance
 
 @task
 def check_connectivity(name=INSTANCE_NAME):
-    instances = filter(lambda x : x.update() == 'running', find_instances(name=name))
+    instances = find_running_instances(name=name)
     for instance in instances:
         check_instance(instance) 
 
@@ -551,28 +680,57 @@ def build_all():
     - Sets the newly build image as the base image.
     """
 
-    existing_running_instances = filter(lambda x : x.update() == 'running', find_instances(name=BASE_INSTANCE_NAME))
+    existing_running_instances = find_running_instances()
     if existing_running_instances and len(existing_running_instances) > 0:
         build_instance = existing_running_instances[0]
         check_instance(build_instance)
         print blue('Using existing instance %s...' % build_instance.id)
+        created=False
     else:     
         print blue('Launching build instance...')
-        build_instance = launch_instance_and_wait(BASE_IMAGE_NAME, BASE_INSTANCE_NAME)
+        build_instance = launch_instance_and_wait()
+        created=True
     global EC2_BUILD_INSTANCE
     EC2_BUILD_INSTANCE = build_instance.id
     with settings(host_string='root@%s' % build_instance.dns_name):
         print blue('Building image...')
-        make_image()
+        image = make_image()
         print blue('Checking that image works...')
-        new_instance = launch_instance_and_wait()
+        new_instance = launch_instance_and_wait(IMAGE_NAME, INSTANCE_NAME)
         new_instance.terminate()
+        print blue('Building S3 image...')
+        s3_image = create_s3_image()
+        print blue('Checking that image works...')
+        new_instance = launch_instance_and_wait(S3_IMAGE_NAME, S3_INSTANCE_NAME)
+        new_instance.terminate()        
         print blue('Cleaning build workspace...')
         decomission_volume()
         build_instance.terminate()
         print blue('Promoting new image to base image')
         change_base(find_images, BASE_IMAGE_NAME)
-        change_base(find_snapshots, BASE_IMAGE_NAME, IMAGE_NAME)
+        change_base(find_snapshots, BASE_IMAGE_NAME, IMAGE_NAME)        
+        change_base(find_images, BASE_S3_IMAGE_NAME, S3_IMAGE_NAME)
+        print blue('Making images public')
+        image.connection.modify_image_attribute(image.id,groups='all')
+        s3_image.connection.modify_image_attribute(s3_image.id,groups='all')
+    if created:
+        build_instance.terminate()
         
+        
+@task
+def clean_all():
+    delete_instances(INSTANCE_NAME)
+    delete_instances(S3_INSTANCE_NAME)
+    delete_images()
+    delete_s3_image()
+    delete_image_snapshots()
+    decomission_volume()
     
     
+env.user = 'root'
+try:  
+    # There may be no current instance
+    env.hosts = [ get_hostname_from_instance()]
+except:
+    # Try to find a valid running instance
+    get_build_instance()
