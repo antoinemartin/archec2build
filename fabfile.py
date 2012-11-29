@@ -117,6 +117,16 @@ Server = http://archlinux.supsec.org/$repo/os/$arch
     
 
 def create_ec2_connection(region=config.EC2_REGION):
+    """
+    Creates an EC2 connection.
+    
+    :type region: string
+    :param region: The region to connect to. By default, connects to
+        the region specified in the ``config`` module.
+    
+    :rtype: class:`boto.ec2.connection`.
+    :return: The boto connection. 
+    """
     return boto.ec2.connect_to_region(config.EC2_REGION, aws_access_key_id=config.AWS_ACCESS_KEY_ID, aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY)
 
 def get_instance(connection=create_ec2_connection, instance_id=None):
@@ -167,10 +177,10 @@ BASE_S3_INSTANCE_NAME = getattr(config, 'BASE_S3_INSTANCE_NAME', INSTANCE_NAME_T
 def get_kernel(s3=False, region=config.EC2_REGION, arch = ARCH ):
     EC2_PV_KERNELS = {
     
-      'us‐east‐1' : ('aki‐4c7d9525', 'aki‐4e7d9527', 'aki‐407d9529', 'aki‐427d952b'),
-      'us‐west‐1' : ('aki‐9da0f1d8', 'aki‐9fa0f1da', 'aki‐99a0f1dc', 'aki‐9ba0f1de'),
-      'eu‐west‐1' : ('aki‐47eec433', 'aki‐41eec435', 'aki‐4deec439', 'aki‐4feec43b'),
-      'ap‐southeast‐1' : ('aki‐6fd5aa3d', 'aki‐6dd5aa3f', 'aki‐13d5aa41', 'aki‐11d5aa43'),
+      'us-east-1' : ('aki-4c7d9525', 'aki-4e7d9527', 'aki-407d9529', 'aki-427d952b'),
+      'us-west-1' : ('aki-9da0f1d8', 'aki-9fa0f1da', 'aki-99a0f1dc', 'aki-9ba0f1de'),
+      'eu-west-1' : ('aki-47eec433', 'aki-41eec435', 'aki-4deec439', 'aki-4feec43b'),
+      'ap-southeast-1' : ('aki-6fd5aa3d', 'aki-6dd5aa3f', 'aki-13d5aa41', 'aki-11d5aa43'),
     }
     if not EC2_PV_KERNELS.has_key(region):
         raise Exception("Unknown region %s" % region)
@@ -190,6 +200,9 @@ def remove_packages(*args):
 
 @task()
 def check_install_scripts():
+    """
+    Checks that the build instance contains the necessary packages.
+    """
     out = run('test -h /etc/pacman.d/mirrorlist', quiet=True)
     if out.succeeded:
         print yellow('mirrorlist link bug. Patching...')
@@ -201,7 +214,10 @@ def check_install_scripts():
         
 @task()
 def clean_env():
-    remove_packages('arch-install-scripts')
+    """
+    Removes the packages required to build the AMIs.
+    """
+    remove_packages('arch-install-scripts', 'ec2-ami-tools')
     
 #
 # Find methods
@@ -285,7 +301,8 @@ SNAPSHOT_ID = getattr(config, 'SNAPSHOT_ID', find_snapshots()[0] if USE_SNAPSHOT
 
 @task
 def create_and_attach_volume():
-    """Creates the build volume an attaches it to the build instance.
+    """
+    Creates the build volume an attaches it to the build instance.
     
     If a snapshot id is specified or USE_SNAPSHOT is True, 
     instead of building a new volume,it creates the volume 
@@ -311,6 +328,9 @@ def get_volume():
     
 @task
 def decomission_volume():
+    """
+    Unattach the build volume from the build instance, and delete it.
+    """
     connection = create_ec2_connection()
     instance = get_instance(connection)
     volume, mount_point = find_build_device(instance)
@@ -329,6 +349,7 @@ def decomission_volume():
     
 @task
 def create_volume_partitions(input_string=FDISK_INPUT):
+    "Creates the partitions on the build volume." 
     instance = get_instance()
     volume, mount_point = find_build_device(instance)
     if not volume:
@@ -343,23 +364,44 @@ def create_volume_partitions(input_string=FDISK_INPUT):
 
 @task
 def delete_volume_partitions():
+    "Deletes the partitions on the build volume."
     create_volume_partitions(FDISK_DELETE_INPUT)
             
 @task
 def format_volume_partitions():
+    "Formats the build volume partitions"
     instance, volume, device_name = get_volume()
     run("mkfs.ext4 -L ac2root %s1" % device_name)
     #run("mkswap -L ac2swap %s2" % device_name)
 
 def mount_main_partition(device_name):
+    """
+    Mounts the main build volume partition in the directory
+    specified by ``MAIN_PARTITION_MOUNT_POINT``.
+    """
     run('mkdir -p %s' % MAIN_PARTITION_MOUNT_POINT)
     run('mount %s1 %s' % (device_name, MAIN_PARTITION_MOUNT_POINT))
                    
 def unmount_main_partition():
+    """
+    Unmounts the main build volume partition from the directory
+    specified by ``MAIN_PARTITION_MOUNT_POINT``.
+    """
     run('umount %s' % MAIN_PARTITION_MOUNT_POINT)
     run('rm -rf %s' % MAIN_PARTITION_MOUNT_POINT)
 
 def create_snapshot(name=SNAPSHOT_NAME):
+    """
+    Creates a snapshot of the build volume.
+    
+    The method waits for the snapshot to be completed.
+    
+    :type name: string
+    :param name: The name of the snapshot to use.
+    
+    :rtype: class:`boto.ec2.snapshot` or ``None``.
+    :return: The snapshot created.
+    """
     instance, volume, device_name = get_volume()
     snapshot = volume.connection.create_snapshot(volume.id, name)
     if snapshot:    
@@ -376,13 +418,25 @@ def create_snapshot(name=SNAPSHOT_NAME):
                 
 @task
 def create_volume_snapshot():
+    "Creates a snapshot of the build volume"
     create_snapshot()
     
 def get_packages(filename=PACKAGES_FILENAME):
+    """
+    Returns the packages contained in ``filename`` as a space 
+    delimited string.
+    
+    Every line starting by # is skipped. 
+    
+    :type filename: string
+    :param filename: The name of the file containing the packages 
+        to be installed.
+    """
     return ' '.join(filter(lambda line: not line.startswith('#'), [line[:-1] for line in open(filename)]))
 
 @task 
 def bootstrap_archlinux():
+    "Installs the base packages on the build volume."
     instance, volume, device_name = get_volume()
     mount_main_partition(device_name)
     arch = run('uname -m')    
@@ -398,6 +452,19 @@ def bootstrap_archlinux():
     
 @task
 def configure_archlinux():
+    """
+    Configures the Archlinux build volume.
+    
+    Here is a summary of the configuration:
+    - Set basic instance information: hostname, localtime, language and keymap.
+    - Generate locales.
+    - Enable base services in systemd: cron, dhcpcd, sshd and ec2 bootstrapping.
+    - Install the PV Grub menu.lst boot file.
+    - Configure the root account.
+    - Add the wheel group to the sudoers.
+    - Generate the fstab.
+    - Install the default pacman.conf.    
+    """
     instance, volume, device_name = get_volume()
 
     mount_main_partition(device_name)
@@ -467,6 +534,18 @@ def configure_archlinux():
     
 @task
 def create_image(name=IMAGE_NAME, description=IMAGE_DESCRIPTION):
+    """
+    Create an EBS AMI from the build volume.
+    
+    :type name: string
+    :param name: The name of the AMI to use.
+    
+    :type description: string
+    :param description: The description of the AMI.
+    
+    :rtype: class:`boto.ec2.Image` or ``None``
+    :return: The image produced.
+    """
     instance, volume, device_name = get_volume()
     snapshot = create_snapshot(IMAGE_NAME)
     image = None
@@ -500,13 +579,39 @@ def create_image(name=IMAGE_NAME, description=IMAGE_DESCRIPTION):
     return image
 
 @task
-def delete_images(name=IMAGE_NAME):
+def deregister_images(name=IMAGE_NAME):
+    """
+    Deregister the images with the given ``name``.
+    
+    :type name: string
+    :param name: The name of the image to delete. By default,
+        deletes the current build image (``IMAGE_NAME``).
+    """
     for image in find_images(name=name):
         print green('Deleting image %s' % image.id)
         image.deregister()
 
 @task
 def launch_instance(image_name=BASE_IMAGE_NAME, instance_name=BASE_INSTANCE_NAME):
+    """
+    Launch an instance. 
+    
+    It uses ``BASE_IMAGE_NAME`` as the default image, and
+    ``BASE_INSTANCE_NAME`` as the default instance name.
+    It waits for the instance to be running, but doesnt' 
+    wait for the instance startup.
+    
+    :type image_name: string
+    :param image_name: The name of the image to launch (``BASE_IMAGE_NAME``
+        by default).
+        
+    :type instance_name: string
+    :param instance_name: The name to give to the launched      
+        instance ((``BASE_INSTANCE_NAME`` by default).
+        
+    :rtype: class:`boto.ec2.Instance` or ``None``.
+    :return: the launched instance.
+    """
     images = find_images(name=image_name)
     instance = None
     if not images or len(images) == 0:
@@ -538,7 +643,13 @@ def launch_instance(image_name=BASE_IMAGE_NAME, instance_name=BASE_INSTANCE_NAME
 
 
 @task
-def delete_instances(name=INSTANCE_NAME):
+def terminate_instances(name=INSTANCE_NAME):
+    """
+    Terminate instances with the given name.
+    
+    :type name: string
+    :param name: the name of the instances to terminate.
+    """
     for instance in find_instances(name=name):
         if instance.update() == 'running':
             print green('Deleting running instance with id %s and dns_name %s' % (instance.id, instance.dns_name))
@@ -546,6 +657,29 @@ def delete_instances(name=INSTANCE_NAME):
             
 @task
 def create_s3_image(name=S3_IMAGE_NAME, description=IMAGE_DESCRIPTION):
+    """
+    Creates an instance store (S3) based image from the build volume.
+    
+    A call to this task should come after the call to :method:`create_image`
+    as it modifies the build environment in a way that makes it 
+    unsuitable for a call to :method:`create_image` afterwards.
+    
+    This method assumes that the build environment contains the 
+    ``ec2-ami-tools`` package to bundle the image. A previous
+    call to :method:`check_install_scripts` ensures that the 
+    package is installed in the build environment.
+    
+    :type name: string
+    :param name: name of the image to build. `S3_IMAGE_NAME`
+        by default.
+        
+    :type description: string
+    :param description: The description for the image.
+        `IMAGE_DESCRIPTION` by default.
+        
+    :rtype: class:`boto.ec2.Image` or ``None``
+    :return: the built image.
+    """
     instance, volume, device_name = get_volume()
     mount_main_partition(device_name)
     
@@ -608,7 +742,17 @@ def create_s3_image(name=S3_IMAGE_NAME, description=IMAGE_DESCRIPTION):
     
     
 @task
-def delete_s3_image(name=S3_IMAGE_NAME):
+def deregister_s3_image(name=S3_IMAGE_NAME):
+    """
+    Deregister the S3 image with the specified ``name``.
+    
+    This method not only deregister the image, it also
+    deletes the bundle from the S3 bucket.
+    
+    :type name: string
+    :param name: the name of the image to delete.
+        ``S3_IMAGE_NAME`` by default.
+    """
     for image in find_images(name=name):
         print green('Deleting image %s' % image.id)
         image.deregister()
@@ -629,6 +773,27 @@ def delete_s3_image(name=S3_IMAGE_NAME):
     
 @task
 def make_image(create_snapshot=False):
+    """
+    Makes the EBS based image from scratch.
+    
+    This taks is an aggregate of the following tasks:
+        
+    - :method:`check_install_scripts`
+    - :method:`create_and_attach_volume`
+    - :method:`create_volume_partitions`
+    - :method:`format_volume_partitions`
+    - :method:`bootstrap_archlinux`
+    - :method:`create_volume_snapshot` (optional)
+    - :method:`configure_archlinux`
+    - :method:`create_image`
+    
+    :type create_snapshot: boolean
+    :param create_snapshot: Create a build snapshot just after
+        the call to :method:`bootstrap_archlinux` if ``True``.
+        
+    :rtype: :class:`boto.ec2.Image` or ``None``.
+    :return: The build image.
+    """
     check_install_scripts()
     create_and_attach_volume()
     time.sleep(10)
@@ -642,6 +807,16 @@ def make_image(create_snapshot=False):
     
     
 def check_instance(instance):
+    """
+    Checks that the instance is available through SSH.
+    
+    :type instance: :class:`boto.ec2.Instance`
+    :param instance: The instance to check.
+    
+    :rtype: boolean
+    :return: ``True`` if the instance is available, ``False``
+        if not.
+    """
     with settings(
         hide('output'),
         host_string='root@%s' % instance.dns_name, 
@@ -652,6 +827,9 @@ def check_instance(instance):
     
 @task 
 def launch_instance_and_wait(image_name=BASE_IMAGE_NAME, instance_name=BASE_INSTANCE_NAME):
+    """
+    Launch an instance with the specified image and waits for it to be available.    
+    """
     instance = launch_instance(image_name, instance_name)
     check_instance(instance)
     return instance
@@ -676,7 +854,8 @@ def change_base(find_method, base_name, new_name=None):
     
 @task(default=True)
 def build_all():
-    """This is the default task.
+    """
+    Builds the EBS and S3 based images.
     
     This task does the following:
     - Launches an instance of the current _working_ image.
@@ -724,10 +903,10 @@ def build_all():
         
 @task
 def clean_all():
-    delete_instances(INSTANCE_NAME)
-    delete_instances(S3_INSTANCE_NAME)
-    delete_images()
-    delete_s3_image()
+    terminate_instances(INSTANCE_NAME)
+    terminate_instances(S3_INSTANCE_NAME)
+    deregister_images()
+    deregister_s3_image()
     delete_image_snapshots()
     decomission_volume()
     
