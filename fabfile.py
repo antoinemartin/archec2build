@@ -828,20 +828,68 @@ def check_instance(instance):
 @task 
 def launch_instance_and_wait(image_name=BASE_IMAGE_NAME, instance_name=BASE_INSTANCE_NAME):
     """
-    Launch an instance with the specified image and waits for it to be available.    
+    Launch an instance with the specified image and waits for it to be available.
+    
+    After the instance is launched, the task tries to establish
+    an SSH connection.
+    
+    :type image_name: string
+    :param image_name: The name of the image to launch.
+        ``BASE_IMAGE_NAME`` by default.
+        
+    :type instance_name: string
+    :param instance_name: The name to give to the instance.
+        ``BASE_INSTANCE_NAME`` by default.
     """
     instance = launch_instance(image_name, instance_name)
     check_instance(instance)
     return instance
 
 @task
-def check_connectivity(name=INSTANCE_NAME):
+def check_access(name=INSTANCE_NAME):
+    """
+    Check SSH access for instances of the specified name.
+    
+    :type name: string
+    :param name: the name of the instances to check.
+        ``INSTANCE_NAME`` by default.
+    """
     instances = find_running_instances(name=name)
     for instance in instances:
         check_instance(instance) 
 
 
 def change_base(find_method, base_name, new_name=None):
+    """
+    Change the base item (image, snapshot, instance).
+    
+    When launching a build instance, the AMI that is launched
+    is the AMI containing the tag ``BASE_IMAGE_NAME``.
+    
+    When a new AMI has been built and successfully tested,
+    it can take over as the base image for new instances.
+    
+    To do that, we remove the base image tag from the image
+    that currently holds it and give it to the new image; 
+    same for the snapshot, ...
+    
+    this method just does that.
+    
+    :type find_method: callable
+    :param method:  the method used to find the item whose tag
+        needs to be changed. It can be one of :method:`find_images`,
+        :method:`find_snapshots`, ...
+    
+    :type base_name: string
+    :param base_name: The base name tag to remove to the old
+        item and to apply to the new item.
+        
+    :type new_name: string
+    :param new_name: name of the ``name`` keyword parameter to
+        pass to the ``find_method`` to return the new base item.
+        If not specified, ``find_method`` will be called without
+        parameters.
+    """
     old = None 
     try:
         old = find_method(name=base_name)[0]
@@ -903,6 +951,15 @@ def build_all():
         
 @task
 def clean_all():
+    """
+    Cleans all the build environment.
+    
+    This method will do the following:
+    - Terminate built image instances (both EBS and S3) running.
+    - De-register EBS and S3 images.
+    - Delete image snapshots.
+    - Unmount and delete the build volume.
+    """
     terminate_instances(INSTANCE_NAME)
     terminate_instances(S3_INSTANCE_NAME)
     deregister_images()
