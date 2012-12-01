@@ -2,3 +2,4 @@
 config.py
 .project
 .pydevproject
+.settings
