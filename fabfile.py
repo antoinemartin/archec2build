@@ -97,7 +97,7 @@ def create_ec2_connection(region=config.EC2_REGION):
 def get_instance(connection=create_ec2_connection, instance_id=None):
     if callable(connection):
         connection = connection()
-    instance_id = instance_id or get_build_instance()
+    instance_id = instance_id or get_build_instance(connection)
     reservation = connection.get_all_instances(instance_ids=(instance_id,))[0]
     if not reservation:
         raise Exception('No instance with name %s' % instance_id)
@@ -110,7 +110,7 @@ def get_arch():
         return 'x86_64'
     
 def get_hostname_from_instance(connection=create_ec2_connection, instance_id=None):
-    instance_id = instance_id or get_build_instance()
+    instance_id = instance_id or get_build_instance(connection)
     return get_instance(connection, instance_id).dns_name
     
 
@@ -231,7 +231,7 @@ def find_instances(connection=create_ec2_connection, name=INSTANCE_NAME):
 def find_running_instances(connection=create_ec2_connection, name=BASE_INSTANCE_NAME):
     return filter(lambda x : x.update() == 'running', find_instances(connection,name))
     
-def get_build_instance():
+def get_build_instance(connection=create_ec2_connection):
     """
     Returns the build instance.
     
@@ -240,9 +240,11 @@ def get_build_instance():
     The method will take the first running instance tagged with
     ``BASE_INSTANCE_NAME`` as the running instance.
     """
-    global EC2_BUILD_INSTANCE,env
+    global EC2_BUILD_INSTANCE,env    
     if EC2_BUILD_INSTANCE == 'Unknown':
-        running_instances = find_running_instances()
+        if callable(connection):
+            connection = connection()        
+        running_instances = find_running_instances(connection)
         if running_instances and len(running_instances) > 0:
             build_instance = running_instances[0]
             EC2_BUILD_INSTANCE = build_instance.id
@@ -674,7 +676,6 @@ def create_s3_image(name=S3_IMAGE_NAME, description=IMAGE_DESCRIPTION):
         'secret' : config.AWS_SECRET_ACCESS_KEY,
         'manifest' : '/mnt/%s.manifest.xml' % name,
         'bucket' : config.S3_AMI_BUCKET,
-        'location' : config.S3_LOCATION,
         'region' : config.EC2_REGION,
     }
     
@@ -727,7 +728,6 @@ def deregister_s3_image(name=S3_IMAGE_NAME):
         'manifest' : '%s.manifest.xml' % name,
         'prefix' : name,
         'bucket' : config.S3_AMI_BUCKET,
-        'location' : config.S3_LOCATION,
         'region' : config.EC2_REGION,
     }
     local('ec2-delete-bundle -b %(bucket)s -p %(prefix)s -a %(access)s -s %(secret)s -y' % parameters)
