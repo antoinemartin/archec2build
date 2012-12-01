@@ -2,7 +2,8 @@
 import config
 import boto
 import boto.ec2
-from boto.ec2.blockdevicemapping import EBSBlockDeviceType, BlockDeviceMapping 
+from boto.ec2.blockdevicemapping import EBSBlockDeviceType, BlockDeviceMapping ,\
+    BlockDeviceType
 from fabric.colors import green, red, yellow, white, blue
 from fabric.api import *
 from fabric.utils import abort
@@ -36,36 +37,6 @@ EC2_BUILD_INSTANCE = getattr(config, 'EC2_BUILD_INSTANCE', 'Unknown')
 ##################
 # TEMPLATES
 ##################
-FDISK_INPUT_SAV="""n
-p
-
-
-+%dG
-n
-p
-
-
-
-t
-2
-82
-w
-""" % MAIN_PARTITION_SIZE
-
-FDISK_INPUT="""n
-p
-
-
-
-w
-"""
-
-FDISK_DELETE_INPUT="""d
-1
-d
-w
-"""
-
 MINIMAL_PACMAN_CONF="""
 [options]
 HoldPkg     = pacman glibc
@@ -87,18 +58,12 @@ timeout 1
 hiddenmenu
 
 title  Arch Linux
-    root   (hd0,0)
+    root   (hd0)
     kernel /boot/vmlinuz-linux root=/dev/xvda1 console=hvc0 spinlock=tickless ro rootwait rootfstype=ext4 earlyprintk=xen,verbose loglevel=7
     initrd /boot/initramfs-linux.img
 """
 
 FSTAB_TEMPLATE="""
-tmpfs /tmp tmpfs nodev,nosuid    0       0
-UUID=%(main_id)s / auto defaults,relatime,data=ordered 0 2
-"""
-#UUID=%(swap_id)s none swap defaults 0 0
-
-S3_FSTAB_TEMPLATE="""
 tmpfs /tmp tmpfs nodev,nosuid    0       0
 /dev/xvda1 / auto defaults,relatime,data=ordered 0 2
 /dev/xvda3 none swap defaults 0 0
@@ -174,7 +139,7 @@ BASE_INSTANCE_NAME = getattr(config, 'BASE_INSTANCE_NAME', INSTANCE_NAME_TEMPLAT
 BASE_S3_INSTANCE_NAME = getattr(config, 'BASE_S3_INSTANCE_NAME', INSTANCE_NAME_TEMPLATE % (BASE_S3_PREFIX, ARCH))
 
 
-def get_kernel(s3=False, region=config.EC2_REGION, arch = ARCH ):
+def get_kernel(s3=True, region=config.EC2_REGION, arch = ARCH ):
     EC2_PV_KERNELS = {
     
       'us-east-1' : ('aki-4c7d9525', 'aki-4e7d9527', 'aki-407d9529', 'aki-427d952b'),
@@ -267,6 +232,14 @@ def find_running_instances(connection=create_ec2_connection, name=BASE_INSTANCE_
     return filter(lambda x : x.update() == 'running', find_instances(connection,name))
     
 def get_build_instance():
+    """
+    Returns the build instance.
+    
+    The build instance may be specified by the configuration
+    variable ``EC2_BUILD_INSTANCE``. If it is note configured,
+    The method will take the first running instance tagged with
+    ``BASE_INSTANCE_NAME`` as the running instance.
+    """
     global EC2_BUILD_INSTANCE,env
     if EC2_BUILD_INSTANCE == 'Unknown':
         running_instances = find_running_instances()
@@ -348,31 +321,10 @@ def decomission_volume():
     
     
 @task
-def create_volume_partitions(input_string=FDISK_INPUT):
-    "Creates the partitions on the build volume." 
-    instance = get_instance()
-    volume, mount_point = find_build_device(instance)
-    if not volume:
-        print red("Could not find build volume")
-    else:
-        print green("Found build volume at device %s" % mount_point)
-        with cd('/tmp'):
-            input_filename = 'archec2build_fdisk_input'
-            put(StringIO(input_string), input_filename)
-            run('fdisk %s < %s' % (mount_point, input_filename))
-            run('rm %s' % input_filename)
-
-@task
-def delete_volume_partitions():
-    "Deletes the partitions on the build volume."
-    create_volume_partitions(FDISK_DELETE_INPUT)
-            
-@task
 def format_volume_partitions():
     "Formats the build volume partitions"
     instance, volume, device_name = get_volume()
-    run("mkfs.ext4 -L ac2root %s1" % device_name)
-    #run("mkswap -L ac2swap %s2" % device_name)
+    run("mkfs.ext4 -L ac2root %s" % device_name)
 
 def mount_main_partition(device_name):
     """
@@ -380,8 +332,9 @@ def mount_main_partition(device_name):
     specified by ``MAIN_PARTITION_MOUNT_POINT``.
     """
     run('mkdir -p %s' % MAIN_PARTITION_MOUNT_POINT)
-    run('mount %s1 %s' % (device_name, MAIN_PARTITION_MOUNT_POINT))
-                   
+    run('mount %s %s' % (device_name, MAIN_PARTITION_MOUNT_POINT))
+    
+@task               
 def unmount_main_partition():
     """
     Unmounts the main build volume partition from the directory
@@ -515,10 +468,7 @@ def configure_archlinux():
     # fstab
     fstab = '%s/etc/fstab' % MAIN_PARTITION_MOUNT_POINT
     run('mv %(path)s %(path)s.orig' % { 'path' : fstab})
-    main_partition_id = run('blkid -c /dev/null -s UUID -o value %s1' % device_name)
-    #swap_partition_id = run('blkid -c /dev/null -s UUID -o value %s2' % device_name)
-    fstab_content = FSTAB_TEMPLATE % { 'main_id' : main_partition_id, 'swap_id' : None}
-    put(StringIO(fstab_content), fstab)
+    put(StringIO(FSTAB_TEMPLATE), fstab)
     
     # nameserver
     resolv = '%s/etc/resolv.conf' % MAIN_PARTITION_MOUNT_POINT
@@ -553,22 +503,20 @@ def create_image(name=IMAGE_NAME, description=IMAGE_DESCRIPTION):
         print red('Cannot create image with no snapshot')
     else:
         # Create block device mapping
-        ebs = EBSBlockDeviceType(snapshot_id=snapshot.id, delete_on_termination=True) 
+        ebs = EBSBlockDeviceType(snapshot_id=snapshot.id, delete_on_termination=True)
+        ephemeral0 = BlockDeviceType(ephemeral_name='ephemeral0')
+        swap = BlockDeviceType(ephemeral_name='ephemeral1')
         block_map = BlockDeviceMapping() 
-        block_map['/dev/sda'] = ebs 
-
-        # retrive attributes from current instance (TODO: should have a list)
-        attributes = instance.get_attribute('kernel')
-        attributes.update(instance.get_attribute('ramdisk'))
-        attributes.update(instance.get_attribute('rootDeviceName'))
+        block_map['/dev/sda1'] = ebs 
+        block_map['/dev/sda2'] = ephemeral0 
+        block_map['/dev/sda3'] = swap 
         
         image_id = instance.connection.register_image(
             name,
             description,
             architecture = instance.architecture,
             kernel_id = get_kernel(),
-            ramdisk_id = attributes['ramdisk'],
-            root_device_name = attributes['rootDeviceName'] or '/dev/sda',
+            root_device_name = '/dev/sda1',
             block_device_map = block_map
         )
         
@@ -643,6 +591,16 @@ def launch_instance(image_name=BASE_IMAGE_NAME, instance_name=BASE_INSTANCE_NAME
 
 
 @task
+def launch_build_instance(s3=False):
+    """
+    Launches the build instance.
+    """
+    if s3:
+        return launch_instance(S3_IMAGE_NAME, S3_INSTANCE_NAME)
+    else:
+        return launch_instance(IMAGE_NAME, INSTANCE_NAME)
+
+@task
 def terminate_instances(name=INSTANCE_NAME):
     """
     Terminate instances with the given name.
@@ -654,6 +612,17 @@ def terminate_instances(name=INSTANCE_NAME):
         if instance.update() == 'running':
             print green('Deleting running instance with id %s and dns_name %s' % (instance.id, instance.dns_name))
             instance.terminate()
+
+@task
+def terminate_build_instances(s3=False):
+    """
+    Terminates the build instances running.
+    """
+    if s3:
+        terminate_instances(S3_INSTANCE_NAME)
+    else:
+        terminate_instances(INSTANCE_NAME)
+        
             
 @task
 def create_s3_image(name=S3_IMAGE_NAME, description=IMAGE_DESCRIPTION):
@@ -683,12 +652,8 @@ def create_s3_image(name=S3_IMAGE_NAME, description=IMAGE_DESCRIPTION):
     instance, volume, device_name = get_volume()
     mount_main_partition(device_name)
     
-    # change menu.lst
-    run("sed 's/(hd0,0)/(hd0)/#' -i %s/boot/grub/menu.lst" % MAIN_PARTITION_MOUNT_POINT)
+    # clean the packages to make bundle smaller
     run('yes | LANG=C pacman -r %s -Scc' % MAIN_PARTITION_MOUNT_POINT)
-    
-    fstab = '%s/etc/fstab' % MAIN_PARTITION_MOUNT_POINT
-    put(StringIO(S3_FSTAB_TEMPLATE), fstab)    
     
     cert = '/tmp/cert.pem'
     pk = '/tmp/pk.pem'
@@ -703,7 +668,7 @@ def create_s3_image(name=S3_IMAGE_NAME, description=IMAGE_DESCRIPTION):
         'pk' : pk,
         'arch' : ARCH,
         'prefix' : name,
-        'kernel': get_kernel(True),
+        'kernel': get_kernel(),
         'path' : MAIN_PARTITION_MOUNT_POINT,
         'access' : config.AWS_ACCESS_KEY_ID,
         'secret' : config.AWS_SECRET_ACCESS_KEY,
@@ -715,7 +680,7 @@ def create_s3_image(name=S3_IMAGE_NAME, description=IMAGE_DESCRIPTION):
     
     with settings(warn_only=True):
         print green('Creating image bundle')
-        out = run('ec2-bundle-vol -u %(user)s -c %(cert)s -k %(pk)s -d /mnt -p %(prefix)s -r %(arch)s --kernel %(kernel)s -v %(path)s -B "ami=sda1,root=/dev/sda1,ephemeral0=sda2,swap=sda3"' % parameters)
+        out = run('ec2-bundle-vol -u %(user)s -c %(cert)s -k %(pk)s -d /mnt -p %(prefix)s -r %(arch)s --kernel %(kernel)s -v %(path)s -B "ami=sda1,root=/dev/sda1,ephemeral0=sda2,ephemeral1=sda3"' % parameters)
         #run('ec2-migrate-manifest -c %(cert)s -k %(pk)s -a %(access)s -s %(secret)s -m %(manifest)s --region %(region)s' % parameters)
         run('rm -rf %s %s' % (cert, pk))
         unmount_main_partition()
@@ -797,7 +762,6 @@ def make_image(create_snapshot=False):
     check_install_scripts()
     create_and_attach_volume()
     time.sleep(10)
-    create_volume_partitions()
     format_volume_partitions()
     bootstrap_archlinux()
     if create_snapshot:
@@ -844,6 +808,16 @@ def launch_instance_and_wait(image_name=BASE_IMAGE_NAME, instance_name=BASE_INST
     instance = launch_instance(image_name, instance_name)
     check_instance(instance)
     return instance
+
+@task 
+def launch_build_instance_and_wait(s3=False):
+    """
+    Launches the build instance and wait
+    """
+    if s3:
+        return launch_instance_and_wait(S3_IMAGE_NAME, S3_INSTANCE_NAME)
+    else:
+        return launch_instance_and_wait(IMAGE_NAME, INSTANCE_NAME)
 
 @task
 def check_access(name=INSTANCE_NAME):
@@ -900,6 +874,22 @@ def change_base(find_method, base_name, new_name=None):
         old.remove_tag(base_name)
     _new.add_tag(base_name, '')
     
+@task
+def promote_build_images():
+    """
+    Promote build images as public images.
+    """
+    print blue('Promoting new image to base image')
+    change_base(find_images, BASE_IMAGE_NAME)
+    change_base(find_snapshots, BASE_IMAGE_NAME, IMAGE_NAME)        
+    change_base(find_images, BASE_S3_IMAGE_NAME, S3_IMAGE_NAME)
+    print blue('Making images public')
+    image = find_images(name=BASE_IMAGE_NAME)[0]
+    s3_image = find_images(name=BASE_S3_IMAGE_NAME)[0]
+    image.connection.modify_image_attribute(image.id,groups='all')
+    s3_image.connection.modify_image_attribute(s3_image.id,groups='all')
+    
+    
 @task(default=True)
 def build_all():
     """
@@ -938,13 +928,7 @@ def build_all():
         print blue('Cleaning build workspace...')
         decomission_volume()
         build_instance.terminate()
-        print blue('Promoting new image to base image')
-        change_base(find_images, BASE_IMAGE_NAME)
-        change_base(find_snapshots, BASE_IMAGE_NAME, IMAGE_NAME)        
-        change_base(find_images, BASE_S3_IMAGE_NAME, S3_IMAGE_NAME)
-        print blue('Making images public')
-        image.connection.modify_image_attribute(image.id,groups='all')
-        s3_image.connection.modify_image_attribute(s3_image.id,groups='all')
+        promote_build_images()
     if created:
         build_instance.terminate()
         
