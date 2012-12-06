@@ -11,6 +11,7 @@ from fabric.context_managers import cd
 import time
 import datetime
 from StringIO import StringIO
+import threading
 
 
 #import logging
@@ -59,8 +60,8 @@ hiddenmenu
 
 title  Arch Linux
     root   (hd0)
-    kernel /boot/vmlinuz-linux root=/dev/xvda1 console=hvc0 spinlock=tickless ro rootwait rootfstype=ext4 earlyprintk=xen,verbose loglevel=7
-    initrd /boot/initramfs-linux.img
+    kernel /boot/vmlinuz-linux%(ext)s root=/dev/xvda1 ro rootwait rootfstype=ext4 nomodeset console=hvc0 earlyprintk=xen,verbose loglevel=7
+    initrd /boot/initramfs-linux%(ext)s.img
 """
 
 FSTAB_TEMPLATE="""
@@ -140,18 +141,35 @@ BASE_S3_INSTANCE_NAME = getattr(config, 'BASE_S3_INSTANCE_NAME', INSTANCE_NAME_T
 
 
 def get_kernel(s3=True, region=config.EC2_REGION, arch = ARCH ):
+    #===========================================================================
+    # EC2_PV_KERNELS = {
+    # 
+    #  'us-east-1' : ('aki-4c7d9525', 'aki-4e7d9527', 'aki-407d9529', 'aki-427d952b'),
+    #  'us-west-1' : ('aki-9da0f1d8', 'aki-9fa0f1da', 'aki-99a0f1dc', 'aki-9ba0f1de'),
+    #  'eu-west-1' : ('aki-47eec433', 'aki-41eec435', 'aki-4deec439', 'aki-4feec43b'),
+    #  'ap-southeast-1' : ('aki-6fd5aa3d', 'aki-6dd5aa3f', 'aki-13d5aa41', 'aki-11d5aa43'),
+    # }
+    #===========================================================================
+    
+    
     EC2_PV_KERNELS = {
     
-      'us-east-1' : ('aki-4c7d9525', 'aki-4e7d9527', 'aki-407d9529', 'aki-427d952b'),
-      'us-west-1' : ('aki-9da0f1d8', 'aki-9fa0f1da', 'aki-99a0f1dc', 'aki-9ba0f1de'),
-      'eu-west-1' : ('aki-47eec433', 'aki-41eec435', 'aki-4deec439', 'aki-4feec43b'),
-      'ap-southeast-1' : ('aki-6fd5aa3d', 'aki-6dd5aa3f', 'aki-13d5aa41', 'aki-11d5aa43'),
+      'us-east-1' : ('aki-88aa75e1', 'aki-b6aa75df', 'aki-b4aa75dd', 'aki-b2aa75db', ),
+      'us-west-1' : ('aki-f77e26b2', 'aki-f57e26b0', 'aki-eb7e26ae', 'aki-e97e26ac', ),
+      'us-west-2' : ('aki-fc37bacc', 'aki-fa37baca', 'aki-f837bac8', 'aki-f637bac6', ), 
+      'eu-west-1' : ('aki-71665e05', 'aki-75665e01', 'aki-8b655dff', 'aki-89655dfd', ),      
+      'ap-southeast-1' : ('aki-fe1354ac', 'aki-f81354aa', 'aki-fa1354a8', 'aki-f41354a6', ),
+      'ap-southeast-2' : ('aki-3f990e05', 'aki-3d990e07', 'aki-33990e09', 'aki-31990e0b', ),
+      'ap-northeast-1' : ('aki-44992845', 'aki-42992843', 'aki-40992841', 'aki-3e99283f', ),
+      'sa-east-1' : ('aki-c48f51d9', 'aki-ca8f51d7', 'aki-c88f51d5', 'aki-ce8f51d3', ),
+      'us-gov-west-1' : ('aki-79a4c05a', 'aki-7ba4c058', 'aki-75a4c056', 'aki-77a4c054', ),
     }
+
     if not EC2_PV_KERNELS.has_key(region):
         raise Exception("Unknown region %s" % region)
     kernels = EC2_PV_KERNELS[region]
-    index = 2 if s3 else 0
-    if arch == 'x86_64':
+    index = 0 if s3 else 2
+    if arch != 'x86_64':
         index = index + 1
     return kernels[index]
 
@@ -387,14 +405,17 @@ def get_packages(filename=PACKAGES_FILENAME):
     :param filename: The name of the file containing the packages 
         to be installed.
     """
-    return ' '.join(filter(lambda line: not line.startswith('#'), [line[:-1] for line in open(filename)]))
+    value = ' '.join(filter(lambda line: not line.startswith('#'), [line[:-1] for line in open(filename)]))
+    if ARCH == 'i386':
+        value = value.replace(" linux", " linux-ec2")
+    return value
 
 @task 
 def bootstrap_archlinux():
     "Installs the base packages on the build volume."
     instance, volume, device_name = get_volume()
     mount_main_partition(device_name)
-    arch = run('uname -m')    
+    arch = run('uname -m', quiet=True)    
     pacman_filename = '/tmp/archec2build_pacman.conf'
     put(StringIO(MINIMAL_PACMAN_CONF % { 'arch' : arch}), pacman_filename )
     with hide('output'):
@@ -449,7 +470,8 @@ def configure_archlinux():
     
     # menu.lst
     run('mkdir -p %s/boot/grub' % MAIN_PARTITION_MOUNT_POINT)
-    put(StringIO(GRUB_MENU_LST), '%s/boot/grub/menu.lst' % MAIN_PARTITION_MOUNT_POINT)
+    gru_menu = GRUB_MENU_LST %  { 'ext' : '-ec2' if ARCH  == 'i386' else '' }
+    put(StringIO(gru_menu), '%s/boot/grub/menu.lst' % MAIN_PARTITION_MOUNT_POINT)
 
     # ssh configuration
     sshd_config_filename = '%s/etc/ssh/sshd_config' % MAIN_PARTITION_MOUNT_POINT
@@ -478,7 +500,7 @@ def configure_archlinux():
     put(StringIO("nameserver 172.16.0.23\n"), resolv)
 
     # pacman.conf    
-    arch = run('uname -m')    
+    arch = run('uname -m', quiet=True)    
     pacman_filename = '%s/etc/pacman.conf' % MAIN_PARTITION_MOUNT_POINT
     put(StringIO(MINIMAL_PACMAN_CONF % { 'arch' : arch}), pacman_filename )
     
@@ -542,7 +564,7 @@ def deregister_images(name=IMAGE_NAME):
         image.deregister()
 
 @task
-def launch_instance(image_name=BASE_IMAGE_NAME, instance_name=BASE_INSTANCE_NAME):
+def launch_instance(image_name=BASE_IMAGE_NAME, instance_name=BASE_INSTANCE_NAME, wait=False):
     """
     Launch an instance. 
     
@@ -589,31 +611,51 @@ def launch_instance(image_name=BASE_IMAGE_NAME, instance_name=BASE_INSTANCE_NAME
                 status = instance.update()
             add_name(instance, instance_name)
             print green('Instance %s with dns_name %s launched' % (instance.id, instance.dns_name))
+            if wait:
+                check_instance(instance)
     return instance
 
 
 @task
-def launch_build_instance(s3=False):
+def launch_build_instance(s3=False,wait=False):
     """
     Launches the build instance.
     """
     if s3:
-        return launch_instance(S3_IMAGE_NAME, S3_INSTANCE_NAME)
+        return launch_instance(S3_IMAGE_NAME, S3_INSTANCE_NAME, wait)
     else:
-        return launch_instance(IMAGE_NAME, INSTANCE_NAME)
+        return launch_instance(IMAGE_NAME, INSTANCE_NAME, wait)
 
 @task
-def terminate_instances(name=INSTANCE_NAME):
+def terminate_instances(name=BASE_INSTANCE_NAME):
     """
     Terminate instances with the given name.
     
     :type name: string
     :param name: the name of the instances to terminate.
     """
-    for instance in find_instances(name=name):
-        if instance.update() == 'running':
-            print green('Deleting running instance with id %s and dns_name %s' % (instance.id, instance.dns_name))
-            instance.terminate()
+    instances = []
+    for instance in find_running_instances(name=name):
+        print green('Deleting running instance with id %s and dns_name %s' % (instance.id, instance.dns_name))
+        instance.terminate()
+        instances.append(instance)
+    return instances
+
+@task
+def reboot_instances(name=INSTANCE_NAME):
+    """
+    Terminate instances with the given name.
+    
+    :type name: string
+    :param name: the name of the instances to terminate.
+    """
+    instances = []
+    for instance in find_running_instances(name=name):
+        print green('Rebooting running instance with id %s and dns_name %s' % (instance.id, instance.dns_name))
+        instance.reboot()
+        instances.append(instance)
+    return instances
+
 
 @task
 def terminate_build_instances(s3=False):
@@ -621,9 +663,62 @@ def terminate_build_instances(s3=False):
     Terminates the build instances running.
     """
     if s3:
-        terminate_instances(S3_INSTANCE_NAME)
+        return terminate_instances(S3_INSTANCE_NAME)
     else:
-        terminate_instances(INSTANCE_NAME)
+        return terminate_instances(INSTANCE_NAME)
+        
+
+class Joiner(object):
+    """
+    Launches threads on a sequence and synchronize termination
+    """
+    
+    def __init__(self):
+        self.semaphore = threading.Semaphore()
+        self.event = threading.Event()
+        
+        
+    def run(self, target, args):
+        self.threads = []
+        self.count = len(args)
+        for arg in args:
+            thread = threading.Thread(target=self.work, args=(target, arg))
+            self.threads.append(thread)
+            thread.start()
+        self.event.wait()             
+        
+    def work(self, target, arg):
+        try:
+            target(arg)
+        finally:
+            with self.semaphore:
+                self.count -= 1
+                if self.count == 0:
+                    self.event.set() 
+            
+                
+
+@task
+def reboot_build_instances(s3=False, wait=False):
+    """
+    Reboot the build instances running.
+    """
+    instances = None
+    if s3:
+        instances = reboot_instances(S3_INSTANCE_NAME)
+    else:
+        instances = reboot_instances(INSTANCE_NAME)
+
+    if wait and instances and len(instances) > 0:
+        def wait_running(instance):
+            time.sleep(2)
+            while instance.update() != 'running':
+                print white('Waiting on %s' % instance.id)
+                time.sleep(3)
+            check_instance(instance)
+        Joiner().run(wait_running, instances)
+                
+            
         
             
 @task
@@ -671,7 +766,7 @@ def create_s3_image(name=S3_IMAGE_NAME, description=IMAGE_DESCRIPTION):
         'arch' : ARCH,
         'prefix' : name,
         'kernel': get_kernel(),
-        'path' : MAIN_PARTITION_MOUNT_POINT,
+        'path' : MAIN_PARTITION_MOUNT_POINT.rstrip('/'),
         'access' : config.AWS_ACCESS_KEY_ID,
         'secret' : config.AWS_SECRET_ACCESS_KEY,
         'manifest' : '/mnt/%s.manifest.xml' % name,
@@ -890,6 +985,21 @@ def promote_build_images():
     s3_image.connection.modify_image_attribute(s3_image.id,groups='all')
     
     
+@task
+def clean_images(connection=create_ec2_connection):
+    if callable(connection):
+        connection = connection()
+        
+    images = connection.get_all_images(filters={'tag-key' : '%s.*' % BASE_PREFIX})
+    for image in filter(lambda image: not ( image.tags.has_key(BASE_IMAGE_NAME) or image.tags.has_key(BASE_S3_IMAGE_NAME)), images):
+        print green('De-registering image %s with name %s' % (image.id, image.name))
+        image.deregister()
+    
+    snapshots = connection.get_all_snapshots(filters={'tag-key' : '%s.*.image.*' % BASE_PREFIX})
+    for snapshot in filter(lambda snapshot: not ( snapshot.tags.has_key(BASE_IMAGE_NAME) or snapshot.tags.has_key(BASE_S3_IMAGE_NAME)), snapshots):
+        print green('Deleting snapshot %s with name %s' % (snapshot.id, snapshot.tags['Name']))
+        snapshot.delete()
+
 @task(default=True)
 def build_all():
     """
@@ -931,6 +1041,7 @@ def build_all():
         promote_build_images()
     if created:
         build_instance.terminate()
+    clean_images()
         
         
 @task
@@ -950,6 +1061,7 @@ def clean_all():
     deregister_s3_image()
     delete_image_snapshots()
     decomission_volume()
+        
     
     
 env.user = 'root'
